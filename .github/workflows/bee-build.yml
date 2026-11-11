@@ -130,6 +130,10 @@ jobs:
               pull_policy: never
               environment:
                 AUDIT_LOG_STDOUT: "true"
+                # Docker sets HOSTNAME to the container id and Next then binds only that
+                # interface, so 127.0.0.1 refuses connections. The production override
+                # (chatbotx-infra docker-compose.override.yml) sets the same value.
+                HOSTNAME: 0.0.0.0
               # upstream's healthcheck needs curl, which the builder image lacks
               healthcheck:
                 test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
