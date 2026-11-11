@@ -55,6 +55,12 @@ const nextConfig: NextConfig = {
     // The Docker build starts from a clean layer and `.next/cache` is not
     // persisted across CI runs, so this cache is written and never read.
     turbopackFileSystemCacheForBuild: false,
+    // Bee fork: keep class names in the SERVER bundle. The `AUDIT` log line is
+    // `<Service>.<action>` and the service is `this.constructor.name`; Turbopack's
+    // default server minification mangles it to `g.create` (seen in fork CI, run
+    // 43064612781). Server-only, client bundle stays minified; the audit smoke
+    // (.bee/audit-smoke.sh) fails if the names are mangled again.
+    turbopackMinify: { server: false },
   },
   poweredByHeader: false,
   async rewrites() {
