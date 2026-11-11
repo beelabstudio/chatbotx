@@ -181,12 +181,12 @@ jobs:
         working-directory: compose-upstream
         run: |
           dc="docker compose -p smoke -f docker-compose.yml -f docker-compose.smoke.yml"
-          $dc logs --no-color --tail 80 builder worker || true
+          $dc logs --no-color builder worker 2>&1 | grep -v "Applied migration\|Queue depth\|scan completed\|enqueued recurring\|finalizeBroadcasts" | tail -120 || true
           $dc down -v || true
 
-      # ---- publish (push to bee/main or manual dispatch from it only) ----
+      # ---- publish: push to bee/main, or a deliberate manual dispatch (never a PR) ----
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/bee/main'
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/bee/main')
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -194,7 +194,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push and record digests
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/bee/main'
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/bee/main')
         run: |
           set -euo pipefail
           {
@@ -213,7 +213,7 @@ jobs:
       # Guard: the packages MUST NOT be anonymously readable (enterprise/ is under a
       # commercial licence). Fails the job if an anonymous token can read the manifest.
       - name: Assert packages are private
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/bee/main'
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/bee/main')
         run: |
           set -euo pipefail
           for name in builder worker; do
