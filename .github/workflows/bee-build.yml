@@ -1,0 +1,226 @@
+name: Bee build (builder + worker)
+
+# Bee Lab Studio fork pipeline (beecreatorstudio#498, ADR-004 in chatbotx-infra).
+#
+# Builds ONLY the two images that contain packages/business (apps/builder and
+# apps/worker -- the only apps whose workspace graph reaches @chatbotx.io/business;
+# realtime, mcp-server and javascript-executor stay the upstream images, pinned by
+# digest in chatbotx-infra). Pushes to a PRIVATE GHCR package (the builder image
+# carries the commercially licensed enterprise/ directory, so it must not be
+# redistributed publicly) and prints the digests the compose override pins.
+#
+# The upstream workflows (CI, Build and Push Docker Images, PR Labeler, publish-*)
+# are DISABLED via the Actions API on this fork, not edited: their files stay
+# byte-identical to upstream so rebases never conflict on them. If you re-enable one
+# of them, `release.yml` will publish PUBLIC images under this org -- don't.
+
+on:
+  push:
+    branches: [bee/main]
+  pull_request:
+    branches: [bee/main]
+  workflow_dispatch:
+
+concurrency:
+  group: bee-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io/beelabstudio
+  # Upstream compose file the production stack is built on (chatbotx-infra README:
+  # /opt/chatbotx is a clean clone of this commit). Used only by the smoke job.
+  COMPOSE_REPO: ChatbotXIO/chatbotx-docker-compose
+  COMPOSE_REF: 2a947fd36b0e1837593d4fee6d4b813abfd37945
+
+jobs:
+  # Unit tests + types for the two packages the patch lives in / runs through.
+  test:
+    name: Test (business + worker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Type-check
+        run: pnpm turbo run check-types --concurrency=2 --filter=@chatbotx.io/business --filter=worker
+      - name: Unit tests
+        run: pnpm turbo run test --concurrency=2 --filter=@chatbotx.io/business --filter=worker
+
+  # Build once, smoke the exact images that get pushed, push the same image IDs.
+  build:
+    name: Build, smoke, push
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          base="$(tr -d '[:space:]' < .bee/UPSTREAM_TAG)"
+          echo "tag=${base}-bee.${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      # The builder's Turbopack compile can exceed the ~16GB of the runner (exit 137);
+      # same swap workaround upstream uses in release.yml. Failure only warns.
+      - name: Add swap for the builder compile
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 16G /mnt/ci-build.swap
+          sudo chmod 600 /mnt/ci-build.swap
+          sudo mkswap /mnt/ci-build.swap
+          sudo swapon /mnt/ci-build.swap
+          free -h
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build builder image (local)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: apps/builder/docker/Dockerfile
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/chatbotx-builder:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=bee-builder
+          cache-to: type=gha,scope=bee-builder,mode=min
+
+      - name: Build worker image (local)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: apps/worker/docker/Dockerfile
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/chatbotx-worker:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=bee-worker
+          cache-to: type=gha,scope=bee-worker,mode=min
+
+      # ---- smoke against the upstream compose the production stack uses ----
+      - name: Checkout upstream compose (pinned commit)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.COMPOSE_REPO }}
+          ref: ${{ env.COMPOSE_REF }}
+          path: compose-upstream
+
+      - name: Write smoke override
+        run: |
+          cat > compose-upstream/docker-compose.smoke.yml <<EOF
+          services:
+            builder:
+              image: ${REGISTRY}/chatbotx-builder:${{ steps.meta.outputs.tag }}
+              pull_policy: never
+              environment:
+                AUDIT_LOG_STDOUT: "true"
+              # upstream's healthcheck needs curl, which the builder image lacks
+              healthcheck:
+                test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+                interval: 10s
+                timeout: 10s
+                retries: 30
+                start_period: 30s
+            worker:
+              image: ${REGISTRY}/chatbotx-worker:${{ steps.meta.outputs.tag }}
+              pull_policy: never
+              environment:
+                AUDIT_LOG_STDOUT: "true"
+          EOF
+
+      - name: Smoke - stack comes up healthy
+        working-directory: compose-upstream
+        run: |
+          set -euo pipefail
+          dc="docker compose -p smoke -f docker-compose.yml -f docker-compose.smoke.yml"
+          $dc up -d --wait --wait-timeout 420 builder worker
+          $dc ps
+          curl -fsS http://127.0.0.1:3123/api/health; echo
+          state="$($dc ps --format '{{.State}}' worker)"
+          test "$state" = "running" || { echo "worker state: $state"; exit 1; }
+
+      # The patch is the Engineer's PR on this fork. Until it lands the source has no
+      # AUDIT_LOG_STDOUT and this step only says so. Once the source mentions it,
+      # .bee/audit-smoke.sh is MANDATORY (fail closed): it must perform an audited
+      # action against http://127.0.0.1:3123 and exit non-zero unless an `AUDIT` line
+      # shows up in `$DC logs builder worker`.
+      - name: Smoke - AUDIT line reaches stdout
+        working-directory: compose-upstream
+        run: |
+          set -euo pipefail
+          export DC="docker compose -p smoke -f docker-compose.yml -f docker-compose.smoke.yml"
+          if ! grep -rq "AUDIT_LOG_STDOUT" ../packages/business/src; then
+            echo "::notice::AUDIT_LOG_STDOUT patch not present in this commit; AUDIT smoke skipped."
+            exit 0
+          fi
+          test -x ../.bee/audit-smoke.sh || { echo "::error::patch present but .bee/audit-smoke.sh missing"; exit 1; }
+          ../.bee/audit-smoke.sh
+
+      - name: Smoke logs and teardown
+        if: always()
+        working-directory: compose-upstream
+        run: |
+          dc="docker compose -p smoke -f docker-compose.yml -f docker-compose.smoke.yml"
+          $dc logs --no-color --tail 80 builder worker || true
+          $dc down -v || true
+
+      # ---- publish (push to bee/main or manual dispatch from it only) ----
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/bee/main'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push and record digests
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/bee/main'
+        run: |
+          set -euo pipefail
+          {
+            echo "### Images (private GHCR) - pin these in chatbotx-infra docker-compose.override.yml"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          for name in builder worker; do
+            ref="${REGISTRY}/chatbotx-${name}:${{ steps.meta.outputs.tag }}"
+            docker push "$ref"
+            digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref")"
+            echo "$digest" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # Guard: the packages MUST NOT be anonymously readable (enterprise/ is under a
+      # commercial licence). Fails the job if an anonymous token can read the manifest.
+      - name: Assert packages are private
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/bee/main'
+        run: |
+          set -euo pipefail
+          for name in builder worker; do
+            repo="beelabstudio/chatbotx-${name}"
+            tok="$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r .token)"
+            code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/${repo}/manifests/${{ steps.meta.outputs.tag }}")"
+            echo "${repo}: anonymous manifest HTTP ${code}"
+            if [ "$code" = "200" ]; then
+              echo "::error::${repo} is PUBLIC. Set it to private in the org package settings and delete the published version."
+              exit 1
+            fi
+          done
