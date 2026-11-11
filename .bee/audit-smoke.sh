@@ -72,7 +72,8 @@ while IFS= read -r line; do
   if ! printf '%s' "$line" | jq -e '
         (.msg | startswith("AUDIT "))
         and (.audit.auditLogId | type == "string" and length > 0)
-        and (.audit.action | type == "string" and length > 0)
+        and (.audit.action | type == "string" and test("^[A-Za-z][A-Za-z0-9]*Service\\.[a-z]+$"))
+        and (.msg == "AUDIT " + .audit.action)
         and (.audit.userId | type == "string" and length > 0)
         and (.audit.workspaceId == "'"${workspace_id}"'")
         and (.audit.userAgent == "'"${UA}"'")
@@ -86,6 +87,14 @@ while IFS= read -r line; do
   fi
 done <<<"$lines"
 [ "$fail" = "0" ] || exit 1
+
+# The two audited actions above must each appear with their service-prefixed action
+# (the bare verb alone says "something was deleted", not what). If a bundler
+# mangled class names this is where it shows up (e.g. `t.create`).
+for expected in "WorkingHoursService.create" "WorkingHoursService.delete"; do
+  printf '%s\n' "$lines" | jq -e --arg a "$expected" 'select(.audit.action == $a)' >/dev/null \
+    || { echo "missing AUDIT action ${expected}"; exit 1; }
+done
 
 printf '%s\n' "$lines" | jq -r '.audit | "\(.action)\tip=\(.ipAddress // "-") source=\(.source // "-")"' || true
 
