@@ -218,9 +218,16 @@ jobs:
           set -euo pipefail
           for name in builder worker; do
             repo="beelabstudio/chatbotx-${name}"
-            tok="$(curl -fsS "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r .token)"
+            # Private package: the anonymous token endpoint answers 401/403 (public: 200).
+            # Anything else (5xx, network) fails the job rather than passing silently.
+            tcode="$(curl -sS -o "$RUNNER_TEMP/tok.json" -w '%{http_code}' "https://ghcr.io/token?scope=repository:${repo}:pull")"
+            case "$tcode" in
+              401|403) echo "${repo}: anonymous token denied (HTTP ${tcode}) -> private"; continue ;;
+              200) tok="$(jq -r '.token // empty' "$RUNNER_TEMP/tok.json")" ;;
+              *) echo "::error::${repo}: unexpected HTTP ${tcode} from the token endpoint"; exit 1 ;;
+            esac
             code="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${tok}" \
-              -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
               "https://ghcr.io/v2/${repo}/manifests/${{ steps.meta.outputs.tag }}")"
             echo "${repo}: anonymous manifest HTTP ${code}"
             if [ "$code" = "200" ]; then
